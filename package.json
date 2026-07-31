@@ -1,8 +1,14 @@
 {
   "name": "oc-pulse",
-  "version": "1.1",
+  "version": "1.1.0",
+  "license": "MIT",
   "copyright": "(c) Bohdan Futerko, 2026, https://www.bf.com.ua, https://github.com/LeBohdan",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LeBohdan/oc-pulse.git"
+  },
   "type": "module",
+  "main": "./index.ts",
   "exports": {
     "./tui": {
       "import": "./tui.tsx"
