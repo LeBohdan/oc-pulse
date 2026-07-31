@@ -1,0 +1,34 @@
+{
+  "name": "oc-pulse",
+  "version": "1.1",
+  "copyright": "(c) Bohdan Futerko, 2026, https://www.bf.com.ua, https://github.com/LeBohdan",
+  "type": "module",
+  "exports": {
+    "./tui": {
+      "import": "./tui.tsx"
+    }
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.14.31 <2",
+    "@opentui/core": "*",
+    "@opentui/solid": "*",
+    "solid-js": "*"
+  },
+  "engines": {
+    "opencode": ">=1.14.31"
+  },
+  "files": [
+    "docs/",
+    "README.md",
+    "index.ts",
+    "tui.tsx"
+  ],
+  "devDependencies": {
+    "@opencode-ai/plugin": "latest",
+    "@opentui/core": "latest",
+    "@opentui/solid": "latest",
+    "@types/node": "^26.1.2",
+    "solid-js": "latest",
+    "typescript": "^5.7.2"
+  }
+}
