@@ -1,12 +1,22 @@
 {
   "name": "oc-pulse",
   "version": "1.1.0",
-  "license": "MIT",
-  "copyright": "(c) Bohdan Futerko, 2026, https://www.bf.com.ua, https://github.com/LeBohdan",
+  "description": "Real-time LLM inference metrics visualization for OpenCode",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/LeBohdan/oc-pulse.git"
+    "url": "https://github.com/LeBohdan/oc-pulse"
   },
+  "license": "MIT",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "llm",
+    "inference",
+    "metrics",
+    "llama-swap",
+    "tps",
+    "tokens-per-second"
+  ],
   "type": "module",
   "main": "./index.ts",
   "exports": {
@@ -24,7 +34,6 @@
     "opencode": ">=1.14.31"
   },
   "files": [
-    "docs/",
     "README.md",
     "index.ts",
     "tui.tsx"
