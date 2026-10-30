@@ -47,7 +47,13 @@ Add to your `~/.config/opencode/cli.json`:
 }
 ```
 
-> oc-pulse 2.x requires OpenCode 2.x. For OpenCode 1.x use oc-pulse 1.x registered in `tui.json`.
+**From git** (default branch `main` = oc-pulse 2.x):
+```bash
+git clone <repo-url>
+```
+
+> oc-pulse 2.x requires OpenCode 2.x. For OpenCode 1.x use the legacy oc-pulse 1.x
+> from the `v1` branch (tag `v1.1.0`), registered in `tui.json`.
 
 ## Options
 
@@ -93,13 +99,40 @@ Live metrics are displayed in the right side of the session prompt:
 
 ## Requirements
 
-- OpenCode >= 1.14.31
+- OpenCode >= 2.1.4
 - A provider with a `baseURL` configured (e.g., a llama-swap instance)
 - **llama-swap-pulse** running on your llama-swap server
 
   Install and configure: https://github.com/LeBohdan/llama-swap-pulse
 
 Providers without `baseURL` (e.g., OpenRouter, API-key providers) will show `inactive` state.
+
+## Troubleshooting
+
+The plugin does not load at all (no widget, no errors in the session):
+
+1. **Stale clone on the legacy v1 branch (when installing from source).** Until
+   late October 2026 the default `main` branch contained the OpenCode 1.x plugin.
+   Older clones may still have that v1 code (`@opencode-ai/plugin <2`), which
+   OpenCode 2 will not load.
+
+   ```bash
+   git checkout main && git pull
+   ```
+
+   Check that `package.json` has `"version": "2.x"` and an `@opencode/plugin >=2.1.4`
+   peer dep. Legacy v1 code is preserved on the `v1` branch (tag `v1.1.0`).
+2. **OpenCode version.** Run `opencode --version`; oc-pulse 2.x requires `>= 2.1.4`.
+3. **Wrong config file.** OpenCode 2 reads plugins from `~/.config/opencode/cli.json`
+   (v1 used `tui.json`). A stale `tui.json` entry does nothing on OpenCode 2.
+4. **Local path.** For `"package": "file:///path/to/oc-pulse"`, the path must point
+   to the checkout that contains the v2 code (see item 1).
+5. **Debug logs.** Set `"options": { "debug": true }` and check
+   `$OPENCODE_DIR/logs/oc-pulse.log` for connection errors.
+
+The widget shows `✕` or stays `disconnected`: the pulse server is unreachable —
+check that llama-swap-pulse is running and that `port` (default `8090`) matches,
+or set the correct `port` in the plugin `options`.
 
 ---
 
