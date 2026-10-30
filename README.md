@@ -25,6 +25,10 @@ This plugin works with **llama-swap-pulse**, a companion server that:
 
 The plugin automatically connects to the pulse server based on your provider's `baseURL` configuration.
 
+When several OpenCode instances share one llama-swap, each instance only displays
+tasks belonging to its current session's model (`upstream` filtering; for llama.cpp
+models without upstream identity a local busy-session heuristic is used).
+
 ## Install
 
 Add to your `~/.config/opencode/cli.json`:

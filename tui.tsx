@@ -12,6 +12,10 @@ const HEALTH_CHECK_INTERVAL = 30_000
 const DISPLAY_REFRESH_MS = 3_000
 const LAST_FINISHED_TTL_MS = 30_000
 const STREAM_WINDOW_MS = 5_000
+// a local session counts as busy while it produced a text/reasoning delta
+// within this window (session.status events are not delivered to TUI plugins
+// in OpenCode 2.2.x, so delta recency is the primary busy signal)
+const BUSY_DELTA_WINDOW_MS = 4_000
 const LIVE_STALE_MS = 1_500
 const SINGLE_SAMPLE_MS = 1_000
 const RECONNECT_BASE_MS = 1_000
@@ -85,6 +89,9 @@ type TaskSnapshot = {
   totalTokens: number
   keep?: number
   sim?: number
+  // true when the task cannot be positively attributed to this instance
+  // (llama.cpp event, more than one locally busy session)
+  unattributed?: boolean
 }
 
 type RawTaskState = {
@@ -289,7 +296,13 @@ function SessionPromptRight(props: {
             return formatStreamDisplay(samples, s.streamCumulative[sessionID!] || 0)
           }
         }
-        return `Processing | ${(t.progress * 100).toFixed(0)}% | ${t.promptTPS.toFixed(1)} t/s | ${formatTokens(t.promptTokens)} tokens`
+        return `Processing${t.unattributed ? "?" : ""} | ${(t.progress * 100).toFixed(0)}% | ${t.promptTPS.toFixed(1)} t/s | ${formatTokens(t.promptTokens)} tokens`
+      }
+      if (t.unattributed) {
+        const samples = sessionID ? s.streamSamples[sessionID] : undefined
+        if (samples?.length) {
+          return formatStreamDisplay(samples, s.streamCumulative[sessionID!] || 0)
+        }
       }
       const tps = t.generationTPS3s || t.generationTPS
       const semantic =
@@ -297,7 +310,7 @@ function SessionPromptRight(props: {
           ? semanticPhase(s.upstream.phase)
           : null
       if (semantic) return `${semantic} | ${formatRate(tps)} t/s | ${formatTokens(t.generatedTokens)} tokens`
-      return `Generation | ${formatRate(tps)} t/s | ${formatTokens(t.generatedTokens)} tokens`
+      return `Generation${t.unattributed ? "?" : ""} | ${formatRate(tps)} t/s | ${formatTokens(t.generatedTokens)} tokens`
     }
 
     const t = s.currentTask
@@ -312,12 +325,11 @@ function SessionPromptRight(props: {
     }
 
     if (!s.currentTask && !lastFinished) {
-      const sessionStatus = sessionID ? ctx.data.session.status(sessionID) : undefined
-      if (sessionStatus && sessionStatus !== "idle") {
-        const samples = sessionID ? s.streamSamples[sessionID] : undefined
-        if (samples?.length) {
-          return formatStreamDisplay(samples, s.streamCumulative[sessionID!] || 0)
-        }
+      // session.status events are not delivered to TUI plugins in OpenCode 2.x,
+      // so rely on stream samples (fresh deltas) as the busy signal
+      const samples = sessionID ? s.streamSamples[sessionID] : undefined
+      if (samples?.length) {
+        return formatStreamDisplay(samples, s.streamCumulative[sessionID!] || 0)
       }
       return "—"
     }
@@ -421,18 +433,6 @@ function mapTaskState(raw: RawTaskState): TaskSnapshot {
   }
 }
 
-async function fetchMetrics(baseUrl: string): Promise<TaskSnapshot | null> {
-  try {
-    const res = await fetch(`${baseUrl}/pulse/metrics`)
-    if (!res.ok) return null
-    const body: SnapshotData = await res.json()
-    if (!body.current_task) return null
-    return mapTaskState(body.current_task)
-  } catch {
-    return null
-  }
-}
-
 function initEventHandlers(state: PluginState, bump: () => void, log?: LogFn) {
   const finalizeTask = (e: MetricEvent, cancelled: boolean) => {
     if (!state.currentTask) return
@@ -451,6 +451,33 @@ function initEventHandlers(state: PluginState, bump: () => void, log?: LogFn) {
     state.currentTask = null
     log?.(`${cancelled ? "task_cancelled" : "task_finished"}: duration=${state.durationMs}ms`)
     bump()
+  }
+
+  // when task_started was filtered out (llama.cpp start events fire before the
+  // first token, while the busy signal is not yet up), acceptTaskEvent may let
+  // a progress event through without a tracked task — synthesize it from the
+  // event payload so the display still shows real metrics
+  const startTaskFromEvent = (e: MetricEvent, phase: "prefill" | "generation") => {
+    if (e.slot === undefined || e.slot === -1) return
+    state.currentTask = {
+      slot: e.slot,
+      task: e.task ?? -1,
+      upstream: e.upstream,
+      phase,
+      promptTokens: 0,
+      generatedTokens: 0,
+      promptTPS: 0,
+      generationTPS: 0,
+      generationTPS3s: 0,
+      progress: 0,
+      finished: false,
+      cancelled: false,
+      updatedAt: Date.now(),
+      totalMs: 0,
+      totalTokens: 0,
+    }
+    state.startAt = Date.now()
+    log?.(`task synthesized: slot=${e.slot}, task=${e.task}, phase=${phase}`)
   }
 
   const handlers: Record<string, (e: MetricEvent) => void> = {
@@ -509,6 +536,7 @@ function initEventHandlers(state: PluginState, bump: () => void, log?: LogFn) {
       bump()
     },
     prefill_progress(e) {
+      if (!state.currentTask) startTaskFromEvent(e, "prefill")
       if (!state.currentTask) return
       state.currentTask.task = e.task ?? state.currentTask.task
       state.currentTask.upstream = e.upstream ?? state.currentTask.upstream
@@ -521,6 +549,7 @@ function initEventHandlers(state: PluginState, bump: () => void, log?: LogFn) {
       bump()
     },
     generation_progress(e) {
+      if (!state.currentTask) startTaskFromEvent(e, "generation")
       if (!state.currentTask) return
       state.currentTask.task = e.task ?? state.currentTask.task
       state.currentTask.upstream = e.upstream ?? state.currentTask.upstream
@@ -563,6 +592,16 @@ function initEventHandlers(state: PluginState, bump: () => void, log?: LogFn) {
     },
   }
   return handlers
+}
+
+function normalizeName(s: string): string {
+  return s.trim().toLowerCase()
+}
+
+function deriveModelID(ctx: Plugin.Context, sessionID: string): string | null {
+  const session = ctx.data.session.get(sessionID)
+  const modelID = session?.model?.id
+  return modelID ? String(modelID) : null
 }
 
 function derivePulseUrl(ctx: Plugin.Context, sessionID: string, portOverride?: number): string | null {
@@ -611,6 +650,116 @@ const plugin: Plugin.Definition = Plugin.define({
       state.version++
       for (const listener of listeners) listener()
       ctx.renderer.requestRender()
+    }
+
+    // Upstream/model this instance's current session should attribute tasks to
+    // (llama-swap model id equals OpenCode's modelID). Null = unknown, no filtering.
+    let expectedUpstream: string | null = null
+    // Local sessions of this instance that are currently generating
+    const busySessions = new Set<string>()
+    // Last text/reasoning delta per local session — the primary busy signal
+    const lastDeltaAt = new Map<string, number>()
+    const deltaBurstLogAt = new Map<string, number>()
+
+    function busyCount(): number {
+      const now = Date.now()
+      const set = new Set<string>(busySessions)
+      for (const [sid, at] of lastDeltaAt) {
+        if (now - at <= BUSY_DELTA_WINDOW_MS) set.add(sid)
+      }
+      return set.size
+    }
+
+    function isForeignUpstream(upstream?: string): boolean {
+      if (!upstream || !expectedUpstream) return false
+      return normalizeName(upstream) !== expectedUpstream
+    }
+
+    function taskKeyMatches(cur: TaskSnapshot, e: MetricEvent): boolean {
+      if (cur.task === -1) return cur.slot === e.slot
+      return cur.slot === e.slot && cur.task === e.task
+    }
+
+    // Select this instance's task from a metrics/snapshot payload. The server's
+    // current_task is global (most recently updated), so with several instances
+    // on one server we scan the tasks list and select by upstream (polled
+    // engines) or the busy-session heuristic (llama.cpp events).
+    function selectOwnTask(body: SnapshotData): RawTaskState | null {
+      const pool = body.tasks?.length ? body.tasks : body.current_task ? [body.current_task] : []
+      const isOwn = (t: RawTaskState): boolean => {
+        if (t.upstream) return !isForeignUpstream(t.upstream)
+        // bare llama.cpp task: only ours while this instance is generating
+        return !expectedUpstream || busyCount() >= 1
+      }
+      const at = (t: RawTaskState): number => (t.updated_at ? new Date(t.updated_at).getTime() : 0)
+      let bestActive: RawTaskState | null = null
+      let bestAny: RawTaskState | null = null
+      for (const t of pool) {
+        if (!isOwn(t)) continue
+        if (!bestAny || at(t) > at(bestAny)) bestAny = t
+        if (!t.finished && !t.cancelled && (!bestActive || at(t) > at(bestActive))) bestActive = t
+      }
+      const best = bestActive ?? bestAny
+      if (!best && body.current_task && !isOwn(body.current_task)) {
+        log?.(`metrics ignored: foreign upstream=${body.current_task.upstream}, expected=${expectedUpstream}`)
+      }
+      return best
+    }
+
+    function acceptTaskEvent(type: string, e: MetricEvent): boolean {
+      // a stale currentTask from another upstream (e.g. model switch or a
+      // snapshot accepted before expectedUpstream was known) must not block
+      // our own events
+      if (state.currentTask && isForeignUpstream(state.currentTask.upstream)) {
+        log?.(`stale task dropped: upstream=${state.currentTask.upstream}, expected=${expectedUpstream}`)
+        state.currentTask = null
+      }
+      const cur = state.currentTask
+      // events from polled engines carry the upstream name: filter precisely
+      if (e.upstream) {
+        if (cur && taskKeyMatches(cur, e)) return true
+        if (isForeignUpstream(e.upstream)) {
+          log?.(`foreign event ignored: type=${type}, upstream=${e.upstream}, expected=${expectedUpstream}`)
+          return false
+        }
+        return true
+      }
+      // llama.cpp events carry no upstream: attribute via local busy sessions
+      if (cur && taskKeyMatches(cur, e)) return true
+      // our tracked task comes from a polled engine — a bare llama.cpp event
+      // that does not match its key cannot be ours
+      if (cur && cur.upstream) {
+        log?.(`foreign event ignored: type=${type}, bare llama.cpp event vs upstream task`)
+        return false
+      }
+      // right after a polled-engine task finished (typical multi-turn gap) the
+      // next polled task_started will carry an upstream; a bare event arriving
+      // in that gap belongs to a neighbouring llama.cpp model
+      const last = state.lastFinished
+      if (last && last.upstream && state.lastFinishedAt && Date.now() - state.lastFinishedAt <= BUSY_DELTA_WINDOW_MS * 2) {
+        log?.(`event ignored: type=${type}, bare llama.cpp event during polled upstream turn`)
+        return false
+      }
+      if (busyCount() < 1) {
+        // no deltas flowing does not mean the session is idle: during a
+        // tool-call gap or model preloading between requests of the same agent
+        // turn a bare event on the slot of our own recently-finished task is
+        // the next request — accept via slot continuity
+        if (
+          last &&
+          !last.upstream &&
+          state.lastFinishedAt &&
+          Date.now() - state.lastFinishedAt <= LAST_FINISHED_TTL_MS &&
+          e.slot !== undefined &&
+          e.slot >= 0 &&
+          e.slot === last.slot
+        ) {
+          return true
+        }
+        log?.(`event ignored: type=${type}, bare llama.cpp event, no local busy sessions`)
+        return false
+      }
+      return true
     }
 
     let currentPulseUrl: string | null = null
@@ -670,15 +819,19 @@ const plugin: Plugin.Definition = Plugin.define({
         state.upstream = null
         state.upstreamAt = 0
         if (snap.upstreams?.length) {
-          const name = snap.current_task?.upstream
-          const match = snap.upstreams.find((u) => (name ? u.upstream === name : true))
+          const best = selectOwnTask(snap)
+          const own = best?.upstream ?? expectedUpstream
+          const match = snap.upstreams.find((u) =>
+            own ? !!u.upstream && normalizeName(u.upstream) === normalizeName(own) : true,
+          )
           if (match) {
             state.upstream = match
             state.upstreamAt = Date.now()
           }
         }
-        if (snap.current_task) {
-          const metrics = mapTaskState(snap.current_task)
+        const best = selectOwnTask(snap)
+        if (best) {
+          const metrics = mapTaskState(best)
           state.currentTask = metrics
           if (!metrics.finished && !metrics.cancelled) {
             state.startAt = metrics.updatedAt
@@ -689,7 +842,7 @@ const plugin: Plugin.Definition = Plugin.define({
         return
       }
       const event = data as MetricEvent
-      const handler = eventHandlers[event.type ?? type]
+      const handler = wrappedHandlers[event.type ?? type]
       if (handler) handler(event)
     }
 
@@ -699,21 +852,43 @@ const plugin: Plugin.Definition = Plugin.define({
       backfillTimer = setTimeout(async () => {
         backfillTimer = undefined
         if (!state.lastFinished) return
-        if (state.lastFinished.slot !== expected.slot || state.lastFinished.task !== expected.task) return
-        if (state.lastFinished.totalMs > 0) return
-        const metrics = await fetchMetrics(currentPulseUrl!)
-        if (!metrics || metrics.slot !== expected.slot || metrics.task !== expected.task) return
-        if (metrics.totalMs <= 0) return
-        state.lastFinished = { ...state.lastFinished, totalMs: metrics.totalMs, totalTokens: metrics.totalTokens }
-        log?.(`backfill: ms=${metrics.totalMs}, tokens=${metrics.totalTokens}`)
-        bump()
+        const lf = state.lastFinished
+        if (lf.slot !== expected.slot || lf.task !== expected.task) return
+        if (lf.totalMs > 0) return
+        try {
+          const res = await fetch(`${currentPulseUrl}/pulse/metrics`)
+          if (!res.ok) return
+          const body: SnapshotData = await res.json()
+          const pool = body.tasks?.length ? body.tasks : body.current_task ? [body.current_task] : []
+          // match by key plus upstream identity so totals never leak from
+          // another instance's task sharing the same slot/task numbers
+          const sameTask = (t: RawTaskState): boolean =>
+            t.slot === expected.slot &&
+            t.task === expected.task &&
+            normalizeName(t.upstream ?? "") === normalizeName(lf.upstream ?? "") &&
+            !isForeignUpstream(t.upstream)
+          const match = pool.find(sameTask) ?? (body.current_task && sameTask(body.current_task) ? body.current_task : null)
+          const metrics = match ? mapTaskState(match) : null
+          if (!metrics || metrics.totalMs <= 0) return
+          state.lastFinished = { ...state.lastFinished, totalMs: metrics.totalMs, totalTokens: metrics.totalTokens }
+          log?.(`backfill: ms=${metrics.totalMs}, tokens=${metrics.totalTokens}`)
+          bump()
+        } catch {
+          // snapshot fetch failed — totals stay local, nothing to do
+        }
       }, METRICS_BACKFILL_DELAY_MS)
     }
 
     const wrappedHandlers: Record<string, (e: MetricEvent) => void> = {}
     for (const [type, handler] of Object.entries(eventHandlers)) {
       wrappedHandlers[type] = (e: MetricEvent) => {
+        if (!acceptTaskEvent(type, e)) return
         handler(e)
+        // llama.cpp events without upstream: ambiguous when more than one local
+        // session is busy — mark so the display can prefer the local ~stream
+        if (!e.upstream && state.currentTask) {
+          state.currentTask.unattributed = busyCount() > 1
+        }
         if ((type === "task_finished" || type === "task_cancelled") && state.lastFinished && !(e.total_ms && e.total_ms > 0)) {
           backfillTotals({ slot: state.lastFinished.slot, task: state.lastFinished.task })
         }
@@ -740,9 +915,22 @@ const plugin: Plugin.Definition = Plugin.define({
       }, delay)
     }
 
+    // Pick our own task from the /pulse/metrics snapshot (see selectOwnTask).
+    async function fetchOwnMetrics(baseUrl: string): Promise<TaskSnapshot | null> {
+      try {
+        const res = await fetch(`${baseUrl}/pulse/metrics`)
+        if (!res.ok) return null
+        const body: SnapshotData = await res.json()
+        const best = selectOwnTask(body)
+        return best ? mapTaskState(best) : null
+      } catch {
+        return null
+      }
+    }
+
     async function reconnect() {
       if (!currentPulseUrl || state.state === "inactive") return
-      const metrics = await fetchMetrics(currentPulseUrl)
+      const metrics = await fetchOwnMetrics(currentPulseUrl)
       if (metrics) {
         state.currentTask = metrics
         if (!metrics.finished && !metrics.cancelled) {
@@ -752,7 +940,10 @@ const plugin: Plugin.Definition = Plugin.define({
         backoffMs = RECONNECT_BASE_MS
         transitionTo("active")
       } else {
-        scheduleReconnect()
+        // metrics snapshot may be empty while the instance stays valid; keep
+        // the SSE subscription alive so a later task_started still arrives
+        closeSSE = connectSSE(`${currentPulseUrl}/pulse/live`, handleSSEEvent, onSSEClose)
+        transitionTo("active")
       }
     }
 
@@ -784,6 +975,9 @@ const plugin: Plugin.Definition = Plugin.define({
       const pulseUrl = derivePulseUrl(ctx, route.sessionID, portOverride)
       log?.(`pulseUrl=${pulseUrl ?? "null"}`)
 
+      const modelID = deriveModelID(ctx, route.sessionID)
+      expectedUpstream = modelID ? normalizeName(modelID) : null
+
       if (pulseUrl !== currentPulseUrl) {
         currentPulseUrl = pulseUrl
         if (!pulseUrl) {
@@ -804,7 +998,7 @@ const plugin: Plugin.Definition = Plugin.define({
       log?.(`health=${health.status}, llama_swap=${health.llama_swap_connected}`)
       if (health.status === 200) {
         if (state.state !== "active") {
-          const metrics = await fetchMetrics(pulseUrl)
+          const metrics = await fetchOwnMetrics(pulseUrl)
           log?.(`metrics=${metrics ? `slot=${metrics.slot},task=${metrics.task},phase=${metrics.phase}` : "null"}`)
           if (metrics) {
             state.currentTask = metrics
@@ -816,14 +1010,12 @@ const plugin: Plugin.Definition = Plugin.define({
               state.startAt = 0
             }
             state.durationMs = metrics.totalMs || null
-            closeSSE = connectSSE(`${pulseUrl}/pulse/live`, handleSSEEvent, onSSEClose)
-            backoffMs = RECONNECT_BASE_MS
-            transitionTo("active")
-          } else {
-            log?.("no metrics, inactive")
-            transitionTo("inactive")
-            return
           }
+          // subscribe regardless: the server's current_task is global and may
+          // belong to another instance — our own events arrive via SSE anyway
+          closeSSE = connectSSE(`${pulseUrl}/pulse/live`, handleSSEEvent, onSSEClose)
+          backoffMs = RECONNECT_BASE_MS
+          transitionTo("active")
         }
       } else if (health.status === 503) {
         closeStream()
@@ -835,9 +1027,19 @@ const plugin: Plugin.Definition = Plugin.define({
     }
 
     function onDelta(ev: { data: { sessionID: string; delta: string } }) {
+      const now = Date.now()
+      lastDeltaAt.set(ev.data.sessionID, now)
+      // throttled delivery proof: log the first delta of each burst so we can
+      // correlate busy windows with rejected bare events in the log
+      if (log) {
+        const prev = deltaBurstLogAt.get(ev.data.sessionID)
+        if (prev === undefined || now - prev > 5_000) {
+          deltaBurstLogAt.set(ev.data.sessionID, now)
+          log(`delta burst: sid=${ev.data.sessionID}, busy=${busyCount()}`)
+        }
+      }
       if (state.state !== "active" && state.state !== "disconnected") return
       const sessionID = ev.data.sessionID
-      const now = Date.now()
       const tokens = estimateStreamTokens(ev.data.delta)
       state.streamCumulative[sessionID] = (state.streamCumulative[sessionID] || 0) + tokens
       state.streamSamples[sessionID] = [
@@ -848,7 +1050,23 @@ const plugin: Plugin.Definition = Plugin.define({
     }
 
     const unsubscribers: Array<() => void> = [
-      ctx.data.on("session.status", () => void doPoll()),
+      ctx.data.on("session.status", (ev) => {
+        const sid = ev.data?.sessionID
+        if (sid) {
+          // prefer the event payload; the data store may not have applied the
+          // update at callback time (race)
+          const raw = ev.data?.status as { type?: string } | undefined
+          const kind = raw?.type ?? ctx.data.session.status(sid)
+          if (kind && kind !== "idle") busySessions.add(sid)
+          else busySessions.delete(sid)
+          log?.(`session.status: sid=${sid}, kind=${kind}`)
+        }
+        void doPoll()
+      }),
+      ctx.data.on("session.idle", (ev) => {
+        const sid = ev.data?.sessionID
+        if (sid) busySessions.delete(sid)
+      }),
       ctx.data.on("session.model.selected", () => void doPoll()),
       ctx.data.on("session.text.delta", onDelta),
       ctx.data.on("session.reasoning.delta", onDelta),

@@ -1,6 +1,6 @@
 {
   "name": "oc-pulse",
-  "version": "2.0.0",
+  "version": "2.1.1",
   "description": "Real-time LLM inference metrics visualization for OpenCode 2",
   "repository": {
     "type": "git",
