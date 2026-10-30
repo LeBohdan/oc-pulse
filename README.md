@@ -38,6 +38,10 @@ Add to your `~/.config/opencode/cli.json`:
 }
 ```
 
+Pin a specific version with `oc-pulse@2.0.0` in `package` if you want to avoid
+automatic updates. Use `cli.json` (not `opencode.json`) for oc-pulse: it is a
+TUI-only plugin and stays active when the CLI connects to a remote server.
+
 **From local file:**
 ```json
 {
