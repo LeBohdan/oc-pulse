@@ -5,7 +5,7 @@
 import { onCleanup } from "solid-js"
 import { mkdirSync, appendFileSync } from "node:fs"
 import { join } from "node:path"
-import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
+import { Plugin, usePlugin } from "@opencode/plugin/tui"
 import type { TextRenderable } from "@opentui/core"
 
 const HEALTH_CHECK_INTERVAL = 30_000
@@ -14,34 +14,63 @@ const LAST_FINISHED_TTL_MS = 30_000
 const STREAM_WINDOW_MS = 5_000
 const LIVE_STALE_MS = 1_500
 const SINGLE_SAMPLE_MS = 1_000
+const RECONNECT_BASE_MS = 1_000
+const RECONNECT_MAX_MS = 30_000
+const METRICS_BACKFILL_DELAY_MS = 300
+const UPSTREAM_STATE_STALE_MS = 5_000
 
 type StreamSample = {
   at: number
   tokens: number
 }
 
-type MetricEvent =
-  | { type: "slot_selected" | "task_started" | "prefill_progress" | "generation_progress" | "generation_complete" | "task_finished" | "task_cancelled" | "total_result" } & Partial<{
-      slot: number
-      task: number
-      phase: "prefill" | "generation" | "finished"
-      prompt_tokens: number
-      prompt_tps: number
-      progress: number
-      generated_tokens: number
-      generation_tps: number
-      generation_tps_3s: number
-      truncated: number
-      total_ms: number
-      total_tokens: number
-      keep: number
-      sim: number
-      timestamp: string
-    }>
+type UpstreamStateData = {
+  upstream?: string
+  engine?: string
+  state?: "idle" | "reading" | "generating" | "queued" | "unloaded"
+  phase?: string | null
+  queued?: number
+  model?: string
+  gpu?: {
+    util?: number
+    mem_used?: number
+    mem_total?: number
+    temp?: number
+    power?: number
+  }
+  ram?: { used?: number; total?: number }
+  cpu?: number
+  updated_at?: string
+}
+
+type MetricEvent = {
+  type: string
+  upstream?: string
+  slot?: number
+  task?: number
+  phase?: "prefill" | "generation" | "finished"
+  prompt_tokens?: number
+  prompt_tps?: number
+  prompt_eval_ms?: number
+  progress?: number
+  generated_tokens?: number
+  generation_tps?: number
+  generation_tps_3s?: number
+  truncated?: number
+  graphs_reused?: number
+  n_tokens?: number
+  total_ms?: number
+  total_tokens?: number
+  keep?: number
+  sim?: number
+  upstream_state?: UpstreamStateData
+  timestamp?: string
+}
 
 type TaskSnapshot = {
   slot: number
   task: number
+  upstream?: string
   phase: "prefill" | "generation" | "finished"
   promptTokens: number
   generatedTokens: number
@@ -58,6 +87,32 @@ type TaskSnapshot = {
   sim?: number
 }
 
+type RawTaskState = {
+  slot: number
+  task: number
+  upstream?: string
+  phase?: "prefill" | "generation" | "finished"
+  prompt_tokens?: number
+  generated_tokens?: number
+  prompt_tps?: number
+  generation_tps?: number
+  generation_tps_3s?: number
+  progress?: number
+  updated_at?: string
+  finished?: boolean
+  cancelled?: boolean
+  total_ms?: number
+  total_tokens?: number
+  keep?: number
+}
+
+type SnapshotData = {
+  active?: boolean
+  current_task?: RawTaskState
+  tasks?: RawTaskState[]
+  upstreams?: UpstreamStateData[]
+}
+
 type PluginState = {
   state: "inactive" | "active" | "disc" | "disconnected"
   currentTask: TaskSnapshot | null
@@ -65,16 +120,14 @@ type PluginState = {
   lastFinishedAt: number | null
   startAt: number
   durationMs: number | null
+  upstream: UpstreamStateData | null
+  upstreamAt: number
   streamSamples: Record<string, StreamSample[]>
   streamCumulative: Record<string, number>
   version: number
 }
 
 type LogFn = (msg: string) => void
-
-type ApiEvent = {
-  properties: Record<string, unknown>
-}
 
 function createLog(debug: boolean): LogFn | undefined {
   if (!debug) return undefined
@@ -114,7 +167,7 @@ function formatDuration(ms: number): string {
 }
 
 function estimateStreamTokens(delta: string): number {
-  return Math.max(1, Math.ceil(Buffer.byteLength(delta, 'utf8') / 5))
+  return Math.max(1, Math.ceil(Buffer.byteLength(delta, "utf8") / 5))
 }
 
 function activeDurationMs(samples: StreamSample[], tailAt?: number): number {
@@ -145,15 +198,19 @@ function calcLiveTps(samples: StreamSample[]): string | null {
   return formatRate(total / durSec)
 }
 
-function calcTotalSamples(samples: StreamSample[]): number {
-  return samples.reduce((sum, s) => sum + s.tokens, 0)
-}
-
 function formatReuseDisplay(keep?: number, sim?: number): string {
   const parts: string[] = []
   if (sim != null) parts.push(`Match ${(sim * 100).toFixed(0)}%`)
   if (keep != null) parts.push(`Reuse ${(keep * 100).toFixed(0)}%`)
-  return parts.join(' | ')
+  return parts.join(" | ")
+}
+
+function semanticPhase(phase: string | null | undefined): string | null {
+  if (!phase) return null
+  if (phase === "thinking") return "Thinking"
+  if (phase.startsWith("writing a tool call:")) return "Tool call"
+  // "reading the prompt" and anything else must not override the task phases
+  return null
 }
 
 function formatStreamDisplay(samples: StreamSample[], cumulative: number): string {
@@ -163,17 +220,17 @@ function formatStreamDisplay(samples: StreamSample[], cumulative: number): strin
 }
 
 function SessionPromptRight(props: {
-  api: Parameters<TuiPlugin>[0]
   state: PluginState
-  sessionID: string
+  sessionID: string | undefined
   subscribe: (listener: () => void) => () => void
 }) {
+  const ctx = usePlugin()
   let text: TextRenderable | undefined
 
   const sync = () => {
     if (!text) return
     text.content = displayText()
-    props.api.renderer.requestRender()
+    ctx.renderer.requestRender()
   }
 
   const unsubscribe = props.subscribe(sync)
@@ -185,25 +242,33 @@ function SessionPromptRight(props: {
         text = ref
         sync()
       }}
-      fg={props.api.theme.current.textMuted}
+      fg={ctx.theme.text.muted}
     >
       {displayText()}
     </text>
   )
 
   function displayText() {
+    // middle-dot separator + leading space so the status does not visually
+    // merge with the preceding prompt/message content
+    const body = statusText()
+    return body ? ` · ${body}` : ""
+  }
+
+  function statusText() {
     const s = props.state
     if (s.state === "inactive") return ""
     if (s.state === "disc") return "✕"
     if (s.state === "disconnected") return "◯"
 
+    const sessionID = props.sessionID
     const ttlOk = s.lastFinishedAt && (Date.now() - s.lastFinishedAt) <= LAST_FINISHED_TTL_MS
     const lastFinished = ttlOk ? s.lastFinished : null
 
     if (s.currentTask?.task === -1) {
-      const samples = s.streamSamples[props.sessionID]
+      const samples = sessionID ? s.streamSamples[sessionID] : undefined
       if (samples?.length) {
-        return formatStreamDisplay(samples, s.streamCumulative[props.sessionID] || 0)
+        return formatStreamDisplay(samples, s.streamCumulative[sessionID!] || 0)
       }
       return formatReuseDisplay(s.currentTask.keep, s.currentTask.sim)
     }
@@ -212,21 +277,26 @@ function SessionPromptRight(props: {
       const t = s.currentTask
       if (t.phase === "prefill") {
         if (t.keep != null && t.promptTokens === 0 && t.promptTPS === 0 && t.progress === 0) {
-          const samples = s.streamSamples[props.sessionID]
+          const samples = sessionID ? s.streamSamples[sessionID] : undefined
           if (samples?.length) {
-            return formatStreamDisplay(samples, s.streamCumulative[props.sessionID] || 0)
+            return formatStreamDisplay(samples, s.streamCumulative[sessionID!] || 0)
           }
           return formatReuseDisplay(t.keep, t.sim)
         }
         {
-          const samples = s.streamSamples[props.sessionID]
+          const samples = sessionID ? s.streamSamples[sessionID] : undefined
           if (samples?.length) {
-            return formatStreamDisplay(samples, s.streamCumulative[props.sessionID] || 0)
+            return formatStreamDisplay(samples, s.streamCumulative[sessionID!] || 0)
           }
         }
         return `Processing | ${(t.progress * 100).toFixed(0)}% | ${t.promptTPS.toFixed(1)} t/s | ${formatTokens(t.promptTokens)} tokens`
       }
       const tps = t.generationTPS3s || t.generationTPS
+      const semantic =
+        s.upstream && Date.now() - s.upstreamAt <= UPSTREAM_STATE_STALE_MS
+          ? semanticPhase(s.upstream.phase)
+          : null
+      if (semantic) return `${semantic} | ${formatRate(tps)} t/s | ${formatTokens(t.generatedTokens)} tokens`
       return `Generation | ${formatRate(tps)} t/s | ${formatTokens(t.generatedTokens)} tokens`
     }
 
@@ -242,11 +312,11 @@ function SessionPromptRight(props: {
     }
 
     if (!s.currentTask && !lastFinished) {
-      const sessionStatus = props.api.state.session.status(props.sessionID)
-      if (sessionStatus?.type !== "idle") {
-        const samples = s.streamSamples[props.sessionID]
+      const sessionStatus = sessionID ? ctx.data.session.status(sessionID) : undefined
+      if (sessionStatus && sessionStatus !== "idle") {
+        const samples = sessionID ? s.streamSamples[sessionID] : undefined
         if (samples?.length) {
-          return formatStreamDisplay(samples, s.streamCumulative[props.sessionID] || 0)
+          return formatStreamDisplay(samples, s.streamCumulative[sessionID!] || 0)
         }
       }
       return "—"
@@ -256,24 +326,28 @@ function SessionPromptRight(props: {
   }
 }
 
-function parseSSEChunk(chunk: string, onEvent: (event: MetricEvent) => void) {
+function parseSSEChunk(chunk: string, onEvent: (type: string, data: unknown) => void) {
   let eventType = "message"
   let data = ""
   for (const line of chunk.split("\n")) {
     if (line.startsWith("event:")) eventType = line.slice(6).trim()
     else if (line.startsWith("data:")) data = line.slice(5).trim()
   }
-  if (data) onEvent({ type: eventType, ...JSON.parse(data) } as MetricEvent)
+  if (!data) return
+  try {
+    onEvent(eventType, JSON.parse(data))
+  } catch {
+    // malformed JSON — skip the chunk, the stream is live, not reliable
+  }
 }
 
-async function connectSSE(
+function connectSSE(
   url: string,
-  onEvent: (event: MetricEvent) => void,
-  onError: (err: Error) => void,
-): Promise<{ close: () => void }> {
+  onEvent: (type: string, data: unknown) => void,
+  onClose: (err: Error) => void,
+): { close: () => void } {
   let buffer = ""
   const decoder = new TextDecoder()
-  let reader: ReadableStreamDefaultReader | null = null
   let closed = false
   const controller = new AbortController()
 
@@ -282,14 +356,14 @@ async function connectSSE(
       headers: { Accept: "text/event-stream" },
       signal: controller.signal,
     })
-    reader = res.body?.getReader()
+    const reader = res.body?.getReader()
     if (!reader) throw new Error("No readable stream")
 
     while (!closed) {
       const { done, value } = await reader.read()
       if (done) {
-        if (!closed) onError(new Error("SSE stream closed"))
-        break
+        if (!closed) onClose(new Error("SSE stream closed"))
+        return
       }
       buffer += decoder.decode(value, { stream: true })
       const chunks = buffer.split("\n\n")
@@ -300,13 +374,15 @@ async function connectSSE(
     }
   }
 
-  readLoop().catch(onError)
+  readLoop().catch((err: unknown) => {
+    if (closed) return
+    onClose(err instanceof Error ? err : new Error(String(err)))
+  })
 
   return {
     close: () => {
       closed = true
       controller.abort()
-      reader?.releaseLock()
     },
   }
 }
@@ -324,40 +400,66 @@ async function fetchHealth(baseUrl: string): Promise<{ status: number; llama_swa
   }
 }
 
+function mapTaskState(raw: RawTaskState): TaskSnapshot {
+  return {
+    slot: raw.slot,
+    task: raw.task,
+    upstream: raw.upstream,
+    phase: raw.phase ?? "prefill",
+    promptTokens: raw.prompt_tokens || 0,
+    generatedTokens: raw.generated_tokens || 0,
+    promptTPS: raw.prompt_tps || 0,
+    generationTPS: raw.generation_tps || 0,
+    generationTPS3s: raw.generation_tps_3s || 0,
+    progress: raw.progress || 0,
+    finished: raw.finished || false,
+    cancelled: raw.cancelled || false,
+    updatedAt: raw.updated_at ? new Date(raw.updated_at).getTime() : Date.now(),
+    totalMs: raw.total_ms || 0,
+    totalTokens: raw.total_tokens || 0,
+    keep: raw.keep,
+  }
+}
+
 async function fetchMetrics(baseUrl: string): Promise<TaskSnapshot | null> {
   try {
     const res = await fetch(`${baseUrl}/pulse/metrics`)
     if (!res.ok) return null
-    const body = await res.json()
+    const body: SnapshotData = await res.json()
     if (!body.current_task) return null
-    return {
-      slot: body.current_task.slot,
-      task: body.current_task.task,
-      phase: body.current_task.phase as "prefill" | "generation" | "finished",
-      promptTokens: body.current_task.prompt_tokens || 0,
-      generatedTokens: body.current_task.generated_tokens || 0,
-      promptTPS: body.current_task.prompt_tps || 0,
-      generationTPS: body.current_task.generation_tps || 0,
-      generationTPS3s: body.current_task.generation_tps_3s || 0,
-      progress: body.current_task.progress || 0,
-      finished: body.current_task.finished || false,
-      cancelled: body.current_task.cancelled || false,
-      updatedAt: new Date(body.current_task.updated_at).getTime(),
-      totalMs: body.current_task.total_ms || 0,
-      totalTokens: body.current_task.total_tokens || 0,
-    }
+    return mapTaskState(body.current_task)
   } catch {
     return null
   }
 }
 
 function initEventHandlers(state: PluginState, bump: () => void, log?: LogFn) {
+  const finalizeTask = (e: MetricEvent, cancelled: boolean) => {
+    if (!state.currentTask) return
+    state.currentTask.cancelled = cancelled
+    state.currentTask.finished = true
+    state.currentTask.updatedAt = Date.now()
+    if (e.total_ms && e.total_ms > 0) {
+      state.durationMs = e.total_ms
+      state.currentTask.totalMs = e.total_ms
+      state.currentTask.totalTokens = e.total_tokens || 0
+    } else {
+      state.durationMs = Date.now() - state.startAt
+    }
+    state.lastFinished = { ...state.currentTask }
+    state.lastFinishedAt = Date.now()
+    state.currentTask = null
+    log?.(`${cancelled ? "task_cancelled" : "task_finished"}: duration=${state.durationMs}ms`)
+    bump()
+  }
+
   const handlers: Record<string, (e: MetricEvent) => void> = {
     slot_selected(e) {
       if (e.slot === -1 || e.slot === undefined) return
       state.currentTask = {
         slot: e.slot,
         task: -1,
+        upstream: e.upstream,
         phase: "prefill",
         promptTokens: 0,
         generatedTokens: 0,
@@ -370,7 +472,7 @@ function initEventHandlers(state: PluginState, bump: () => void, log?: LogFn) {
         updatedAt: Date.now(),
         totalMs: 0,
         totalTokens: 0,
-        keep: e.keep || 0,
+        keep: e.keep,
         sim: e.sim,
       }
       state.startAt = Date.now()
@@ -385,6 +487,7 @@ function initEventHandlers(state: PluginState, bump: () => void, log?: LogFn) {
       state.currentTask = {
         slot: e.slot,
         task: e.task ?? 0,
+        upstream: e.upstream,
         phase: "prefill",
         promptTokens: 0,
         generatedTokens: 0,
@@ -402,12 +505,13 @@ function initEventHandlers(state: PluginState, bump: () => void, log?: LogFn) {
       }
       state.startAt = Date.now()
       state.durationMs = null
-      log?.(`task_started: slot=${e.slot}, task=${e.task}`)
+      log?.(`task_started: slot=${e.slot}, task=${e.task}, upstream=${e.upstream}`)
       bump()
     },
     prefill_progress(e) {
       if (!state.currentTask) return
       state.currentTask.task = e.task ?? state.currentTask.task
+      state.currentTask.upstream = e.upstream ?? state.currentTask.upstream
       state.currentTask.phase = "prefill"
       state.currentTask.promptTokens = e.prompt_tokens || 0
       state.currentTask.promptTPS = e.prompt_tps || 0
@@ -419,6 +523,7 @@ function initEventHandlers(state: PluginState, bump: () => void, log?: LogFn) {
     generation_progress(e) {
       if (!state.currentTask) return
       state.currentTask.task = e.task ?? state.currentTask.task
+      state.currentTask.upstream = e.upstream ?? state.currentTask.upstream
       state.currentTask.generatedTokens = e.generated_tokens || 0
       state.currentTask.generationTPS = e.generation_tps || 0
       state.currentTask.generationTPS3s = e.generation_tps_3s || 0
@@ -437,204 +542,319 @@ function initEventHandlers(state: PluginState, bump: () => void, log?: LogFn) {
       bump()
     },
     task_finished(e) {
-      if (!state.currentTask) return
-      state.currentTask.finished = true
-      state.currentTask.updatedAt = Date.now()
-      if (e.total_ms && e.total_ms > 0) {
-        state.durationMs = e.total_ms
-        state.currentTask.totalMs = e.total_ms
-        state.currentTask.totalTokens = e.total_tokens || 0
-      } else {
-        state.durationMs = Date.now() - state.startAt
-      }
-      state.lastFinished = { ...state.currentTask }
-      state.lastFinishedAt = Date.now()
-      state.currentTask = null
-      log?.(`task_finished: duration=${state.durationMs}ms`)
-      bump()
+      finalizeTask(e, false)
     },
     task_cancelled(e) {
-      if (!state.currentTask) return
-      state.currentTask.cancelled = true
-      state.currentTask.finished = true
-      state.currentTask.updatedAt = Date.now()
-      state.durationMs = Date.now() - state.startAt
-      state.lastFinished = { ...state.currentTask }
-      state.lastFinishedAt = Date.now()
-      state.currentTask = null
-      log?.("task_cancelled")
-      bump()
+      finalizeTask(e, true)
     },
-    total_result(e) {
-      if (!state.currentTask) return
-      if (e.total_ms && e.total_ms > 0) {
-        state.currentTask.totalMs = e.total_ms
-        state.currentTask.totalTokens = e.total_tokens || 0
-        state.currentTask.updatedAt = Date.now()
-        log?.(`total_result: ms=${e.total_ms}, tokens=${e.total_tokens}`)
-        bump()
-      }
+    upstream_state(e) {
+      const data = e.upstream_state
+      if (!data) return
+      // engine state, not task state: only accept it for the active task's
+      // upstream, or while no task is in flight yet
+      const current = state.currentTask
+      if (current && e.upstream && current.upstream && e.upstream !== current.upstream) return
+      const prevSemantic = semanticPhase(state.upstream?.phase)
+      const nextSemantic = semanticPhase(data.phase)
+      state.upstream = data
+      state.upstreamAt = Date.now()
+      // events come ~1/s; only re-render when the displayed semantic phase changes
+      if (prevSemantic !== nextSemantic) bump()
     },
   }
   return handlers
 }
 
-function derivePulseUrl(api: Parameters<TuiPlugin>[0], portOverride?: number): string | null {
-  const route = api.route.current
-  if (route.name !== "session") return null
+function derivePulseUrl(ctx: Plugin.Context, sessionID: string, portOverride?: number): string | null {
+  const session = ctx.data.session.get(sessionID)
+  if (!session?.model?.providerID) return null
 
-  const session = api.state.session.get(route.params.sessionID as string)
-  if (!session) return null
-  if (!session.model?.providerID) return null
+  const location = ctx.location ?? ctx.data.location.default()
+  const providers = ctx.data.location.provider.list(location) ?? []
+  const provider = providers.find((p) => p.id === session.model?.providerID)
+  const baseURL = provider?.settings?.baseURL ? String(provider.settings.baseURL) : null
+  if (!baseURL) return null
 
-  const provider = api.state.provider.find((p) => p.id === session.model.providerID)
-  if (!provider?.options?.baseURL) return null
-
-  const baseURL = String(provider.options.baseURL)
   const url = new URL(baseURL)
   const host = `${url.protocol}//${url.hostname}`
 
-  const port = (portOverride as number | undefined) ?? url.port
+  const port = portOverride ?? (url.port ? Number(url.port) : undefined)
   const pulseBase = port ? `${host}:${port}` : host
 
   return pulseBase
 }
 
-const tui: TuiPlugin = async (api, options) => {
-  const debug = options?.debug === true
-  const portOverride = options?.port
+const plugin: Plugin.Definition = Plugin.define({
+  id: "oc-pulse",
+  setup(ctx) {
+    const debug = ctx.options?.debug === true
+    const portOverride = typeof ctx.options?.port === "number" ? ctx.options.port : undefined
 
-  let currentPulseUrl: string | null = null
+    const log = createLog(debug)
 
-  const log = createLog(debug)
+    const state: PluginState = {
+      state: "inactive",
+      currentTask: null,
+      lastFinished: null,
+      lastFinishedAt: null,
+      startAt: 0,
+      durationMs: null,
+      upstream: null,
+      upstreamAt: 0,
+      streamSamples: {},
+      streamCumulative: {},
+      version: 0,
+    }
 
-  let state: PluginState = {
-    state: "inactive",
-    currentTask: null,
-    lastFinished: null,
-    lastFinishedAt: null,
-    startAt: 0,
-    durationMs: null,
-    streamSamples: {},
-    streamCumulative: {},
-    version: 0,
-  }
+    const listeners = new Set<() => void>()
+    function bump() {
+      state.version++
+      for (const listener of listeners) listener()
+      ctx.renderer.requestRender()
+    }
 
-  const listeners = new Set<() => void>()
-  function bump() {
-    state.version++
-    for (const listener of listeners) listener()
-    api.renderer.requestRender()
-  }
+    let currentPulseUrl: string | null = null
+    let closeSSE: { close: () => void } | undefined
+    let healthCheckTimer: ReturnType<typeof setInterval> | undefined
+    let displayRefreshTimer: ReturnType<typeof setInterval> | undefined
+    let pruneTimer: ReturnType<typeof setInterval> | undefined
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined
+    let backfillTimer: ReturnType<typeof setTimeout> | undefined
+    let backoffMs = RECONNECT_BASE_MS
+    let pollInFlight = false
+    let pollQueued = false
 
-  const eventHandlers = initEventHandlers(state, bump, log)
-  let closeSSE: { close: () => void } | undefined
-  let healthCheckTimer: ReturnType<typeof setInterval> | undefined
-  let displayRefreshTimer: ReturnType<typeof setInterval> | undefined
-  let pruneTimer: ReturnType<typeof setInterval> | undefined
-
-  function transitionTo(nextState: PluginState["state"]) {
-    const prev = state.state
-    state.state = nextState
-    log?.(`State: ${prev} → ${nextState}`)
-
-    if (nextState === "inactive") {
+    function closeStream() {
       closeSSE?.close()
+      closeSSE = undefined
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer)
+        reconnectTimer = undefined
+      }
+    }
+
+    function clearTaskData() {
       state.currentTask = null
       state.lastFinished = null
       state.lastFinishedAt = null
+      state.startAt = 0
+      state.durationMs = null
+      state.upstream = null
+      state.upstreamAt = 0
       state.streamSamples = {}
       state.streamCumulative = {}
-      clearInterval(displayRefreshTimer)
-      displayRefreshTimer = undefined
-      // healthCheckTimer keeps running to auto-reconnect
     }
 
-    log?.(`State: ${prev} → ${nextState}`)
-    bump()
-  }
+    function transitionTo(nextState: PluginState["state"]) {
+      const prev = state.state
+      state.state = nextState
+      log?.(`State: ${prev} → ${nextState}`)
 
-  async function doPoll() {
-    log?.(`doPoll: route=${JSON.stringify(api.route.current.name)}, state=${state.state}`)
-    const route = api.route.current
-    if (route.name !== "session") {
-      log?.("not a session route, inactive")
-      transitionTo("inactive")
-      return
+      if (nextState === "inactive") {
+        closeStream()
+        clearTaskData()
+        clearInterval(displayRefreshTimer)
+        displayRefreshTimer = undefined
+        // healthCheckTimer keeps running to auto-reconnect
+      }
+
+      bump()
     }
 
-    const pulseUrl = derivePulseUrl(api, portOverride as number | undefined)
-    log?.(`pulseUrl=${pulseUrl ?? "null"}`)
+    const eventHandlers = initEventHandlers(state, bump, log)
 
-    if (pulseUrl !== currentPulseUrl) {
-      currentPulseUrl = pulseUrl
+    function handleSSEEvent(type: string, data: unknown) {
+      if (type === "snapshot") {
+        // initial snapshot on SSE connect: resync, useful after reconnect
+        const snap = data as SnapshotData
+        state.upstream = null
+        state.upstreamAt = 0
+        if (snap.upstreams?.length) {
+          const name = snap.current_task?.upstream
+          const match = snap.upstreams.find((u) => (name ? u.upstream === name : true))
+          if (match) {
+            state.upstream = match
+            state.upstreamAt = Date.now()
+          }
+        }
+        if (snap.current_task) {
+          const metrics = mapTaskState(snap.current_task)
+          state.currentTask = metrics
+          if (!metrics.finished && !metrics.cancelled) {
+            state.startAt = metrics.updatedAt
+          }
+          log?.(`snapshot: phase=${metrics.phase}, upstream=${metrics.upstream}`)
+          bump()
+        }
+        return
+      }
+      const event = data as MetricEvent
+      const handler = eventHandlers[event.type ?? type]
+      if (handler) handler(event)
+    }
+
+    function backfillTotals(expected: { slot: number; task: number }) {
+      if (!currentPulseUrl) return
+      if (backfillTimer) clearTimeout(backfillTimer)
+      backfillTimer = setTimeout(async () => {
+        backfillTimer = undefined
+        if (!state.lastFinished) return
+        if (state.lastFinished.slot !== expected.slot || state.lastFinished.task !== expected.task) return
+        if (state.lastFinished.totalMs > 0) return
+        const metrics = await fetchMetrics(currentPulseUrl!)
+        if (!metrics || metrics.slot !== expected.slot || metrics.task !== expected.task) return
+        if (metrics.totalMs <= 0) return
+        state.lastFinished = { ...state.lastFinished, totalMs: metrics.totalMs, totalTokens: metrics.totalTokens }
+        log?.(`backfill: ms=${metrics.totalMs}, tokens=${metrics.totalTokens}`)
+        bump()
+      }, METRICS_BACKFILL_DELAY_MS)
+    }
+
+    const wrappedHandlers: Record<string, (e: MetricEvent) => void> = {}
+    for (const [type, handler] of Object.entries(eventHandlers)) {
+      wrappedHandlers[type] = (e: MetricEvent) => {
+        handler(e)
+        if ((type === "task_finished" || type === "task_cancelled") && state.lastFinished && !(e.total_ms && e.total_ms > 0)) {
+          backfillTotals({ slot: state.lastFinished.slot, task: state.lastFinished.task })
+        }
+      }
+    }
+
+    function onSSEClose(err: Error) {
+      log?.(`SSE closed: ${err.message}`)
+      closeSSE = undefined
+      if (state.state === "active" || state.state === "disconnected") {
+        transitionTo("disconnected")
+        scheduleReconnect()
+      }
+    }
+
+    function scheduleReconnect() {
+      if (reconnectTimer || !currentPulseUrl) return
+      const delay = backoffMs
+      backoffMs = Math.min(backoffMs * 2, RECONNECT_MAX_MS)
+      log?.(`reconnect in ${delay}ms`)
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = undefined
+        void reconnect()
+      }, delay)
+    }
+
+    async function reconnect() {
+      if (!currentPulseUrl || state.state === "inactive") return
+      const metrics = await fetchMetrics(currentPulseUrl)
+      if (metrics) {
+        state.currentTask = metrics
+        if (!metrics.finished && !metrics.cancelled) {
+          state.startAt = metrics.updatedAt
+        }
+        closeSSE = connectSSE(`${currentPulseUrl}/pulse/live`, handleSSEEvent, onSSEClose)
+        backoffMs = RECONNECT_BASE_MS
+        transitionTo("active")
+      } else {
+        scheduleReconnect()
+      }
+    }
+
+    async function doPoll() {
+      if (pollInFlight) {
+        pollQueued = true
+        return
+      }
+      pollInFlight = true
+      try {
+        do {
+          pollQueued = false
+          await pollOnce()
+        } while (pollQueued)
+      } finally {
+        pollInFlight = false
+      }
+    }
+
+    async function pollOnce() {
+      const route = ctx.ui.router.current()
+      log?.(`doPoll: route=${route.type}, state=${state.state}`)
+      if (route.type !== "session") {
+        log?.("not a session route, inactive")
+        transitionTo("inactive")
+        return
+      }
+
+      const pulseUrl = derivePulseUrl(ctx, route.sessionID, portOverride)
+      log?.(`pulseUrl=${pulseUrl ?? "null"}`)
+
+      if (pulseUrl !== currentPulseUrl) {
+        currentPulseUrl = pulseUrl
+        if (!pulseUrl) {
+          transitionTo("inactive")
+          return
+        }
+        closeStream()
+        clearTaskData()
+        backoffMs = RECONNECT_BASE_MS
+      }
+
       if (!pulseUrl) {
         transitionTo("inactive")
         return
       }
-      closeSSE?.close()
-      state.currentTask = null
-      state.lastFinished = null
-      state.lastFinishedAt = null
-      state.streamSamples = {}
-      state.streamCumulative = {}
-    }
 
-    if (!pulseUrl) {
-      transitionTo("inactive")
-      return
-    }
-
-    log?.(`pulseUrl=${pulseUrl}`)
-    const health = await fetchHealth(pulseUrl)
-    log?.(`health=${health.status}, llama_swap=${health.llama_swap_connected}`)
-    if (health.status === 200) {
-      if (state.state !== "active") {
-        const metrics = await fetchMetrics(pulseUrl)
-        log?.(`metrics=${metrics ? JSON.stringify(metrics).slice(0, 80) : "null"}`)
-        if (metrics) {
-          state.currentTask = metrics
-          if (!metrics.finished && !metrics.cancelled) {
-            state.startAt = metrics.updatedAt
+      const health = await fetchHealth(pulseUrl)
+      log?.(`health=${health.status}, llama_swap=${health.llama_swap_connected}`)
+      if (health.status === 200) {
+        if (state.state !== "active") {
+          const metrics = await fetchMetrics(pulseUrl)
+          log?.(`metrics=${metrics ? `slot=${metrics.slot},task=${metrics.task},phase=${metrics.phase}` : "null"}`)
+          if (metrics) {
+            state.currentTask = metrics
+            if (!metrics.finished && !metrics.cancelled) {
+              state.startAt = metrics.updatedAt
+            } else {
+              // finished task picked up from the snapshot: no real start time;
+              // rely on total_ms from the snapshot, do not fake a local duration
+              state.startAt = 0
+            }
+            state.durationMs = metrics.totalMs || null
+            closeSSE = connectSSE(`${pulseUrl}/pulse/live`, handleSSEEvent, onSSEClose)
+            backoffMs = RECONNECT_BASE_MS
+            transitionTo("active")
           } else {
-            state.startAt = Date.now()
-          }
-          state.durationMs = null
-          closeSSE = await connectSSE(`${pulseUrl}/pulse/live`, (e) => {
-            const handler = eventHandlers[e.type]
-            if (handler) handler(e)
-          }, (err) => {
-            console.error(`[oc-pulse] SSE error: ${err.message}`)
-            if (state.state === "active") transitionTo("disconnected")
-          })
-          if (!closeSSE) {
-            console.error(`[oc-pulse] no SSE connection, inactive`)
+            log?.("no metrics, inactive")
             transitionTo("inactive")
             return
           }
-          transitionTo("active")
-        } else {
-          log?.("no metrics, inactive")
-          transitionTo("inactive")
-          return
         }
+      } else if (health.status === 503) {
+        closeStream()
+        transitionTo("disc")
+      } else {
+        closeStream()
+        transitionTo("inactive")
       }
-    } else if (health.status === 503) {
-      closeSSE?.close()
-      transitionTo("disc")
-    } else {
-      closeSSE?.close()
-      transitionTo("inactive")
     }
-  }
 
-  async function bootstrap() {
-    log?.("bootstrap started")
-    await doPoll()
-  }
+    function onDelta(ev: { data: { sessionID: string; delta: string } }) {
+      if (state.state !== "active" && state.state !== "disconnected") return
+      const sessionID = ev.data.sessionID
+      const now = Date.now()
+      const tokens = estimateStreamTokens(ev.data.delta)
+      state.streamCumulative[sessionID] = (state.streamCumulative[sessionID] || 0) + tokens
+      state.streamSamples[sessionID] = [
+        ...(state.streamSamples[sessionID] || []).filter((item: StreamSample) => now - item.at <= STREAM_WINDOW_MS),
+        { at: now, tokens },
+      ]
+      bump()
+    }
 
-  function startTimers() {
-    healthCheckTimer = setInterval(doPoll, HEALTH_CHECK_INTERVAL)
+    const unsubscribers: Array<() => void> = [
+      ctx.data.on("session.status", () => void doPoll()),
+      ctx.data.on("session.model.selected", () => void doPoll()),
+      ctx.data.on("session.text.delta", onDelta),
+      ctx.data.on("session.reasoning.delta", onDelta),
+    ]
+
+    healthCheckTimer = setInterval(() => void doPoll(), HEALTH_CHECK_INTERVAL)
     displayRefreshTimer = setInterval(() => {
       if (state.state === "active") bump()
     }, DISPLAY_REFRESH_MS)
@@ -653,61 +873,36 @@ const tui: TuiPlugin = async (api, options) => {
         }
       }
     }, 1000)
-  }
 
-  api.event.on("session.status", () => doPoll())
+    log?.(`init: portOverride=${portOverride}, debug=${debug}`)
+    void doPoll()
 
-  api.event.on("session.next.model.switched", () => {
-    doPoll()
-  })
+    const slot = ctx.ui.slot({
+      append: "prompt.footer",
+      render: (input) => (
+        <SessionPromptRight
+          state={state}
+          sessionID={input.sessionID}
+          subscribe={(listener) => {
+            listeners.add(listener)
+            return () => {
+              listeners.delete(listener)
+            }
+          }}
+        />
+      ),
+    })
 
-  const unsubDelta = api.event.on("message.part.delta", (evt: ApiEvent) => {
-    if (evt.properties.field !== "text") return
-    const parts = api.state.part(evt.properties.messageID as string)
-    const part = parts.find((item: any) => item.id === evt.properties.partID)
-    if (!part) return
-    if (part.type !== "text" && part.type !== "reasoning") return
-    const sessionID = evt.properties.sessionID as string
-    const delta = evt.properties.delta as string
-    const now = Date.now()
-    const tokens = estimateStreamTokens(delta)
-    state.streamCumulative[sessionID] = (state.streamCumulative[sessionID] || 0) + tokens
-    state.streamSamples[sessionID] = [
-      ...(state.streamSamples[sessionID] || []).filter((item: StreamSample) => now - item.at <= STREAM_WINDOW_MS),
-      { at: now, tokens },
-    ]
-    bump()
-  })
-
-  log?.(`init: portOverride=${portOverride}, debug=${debug}`)
-  startTimers()
-  bootstrap()
-
-  api.slots.register({
-    slots: {
-      session_prompt_right(_ctx, value) {
-        return <SessionPromptRight api={api} state={state} sessionID={value.session_id as string} subscribe={(listener) => {
-          listeners.add(listener)
-          return () => {
-            listeners.delete(listener)
-          }
-        }} />
-      },
-    },
-  })
-
-  api.lifecycle.onDispose(() => {
-    unsubDelta?.()
-    closeSSE?.close()
-    clearInterval(healthCheckTimer)
-    clearInterval(displayRefreshTimer)
-    clearInterval(pruneTimer)
-  })
-}
-
-const plugin: TuiPluginModule & { id: string } = {
-  id: "oc-pulse",
-  tui,
-}
+    return () => {
+      slot?.()
+      for (const unsub of unsubscribers) unsub?.()
+      closeStream()
+      if (backfillTimer) clearTimeout(backfillTimer)
+      clearInterval(healthCheckTimer)
+      clearInterval(displayRefreshTimer)
+      clearInterval(pruneTimer)
+    }
+  },
+})
 
 export default plugin

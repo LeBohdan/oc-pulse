@@ -1,7 +1,7 @@
 {
   "name": "oc-pulse",
-  "version": "1.1.0",
-  "description": "Real-time LLM inference metrics visualization for OpenCode",
+  "version": "2.0.0",
+  "description": "Real-time LLM inference metrics visualization for OpenCode 2",
   "repository": {
     "type": "git",
     "url": "https://github.com/LeBohdan/oc-pulse"
@@ -20,18 +20,17 @@
   "type": "module",
   "main": "./index.ts",
   "exports": {
-    "./tui": {
-      "import": "./tui.tsx"
-    }
+    ".": "./index.ts",
+    "./tui": "./tui.tsx"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.14.31 <2",
-    "@opentui/core": "*",
-    "@opentui/solid": "*",
-    "solid-js": "*"
+    "@opencode/plugin": ">=2.1.4",
+    "@opentui/core": ">=0.6.8",
+    "@opentui/solid": ">=0.6.8",
+    "solid-js": ">=1.9.0"
   },
   "engines": {
-    "opencode": ">=1.14.31"
+    "opencode": ">=2.1.4"
   },
   "files": [
     "README.md",
@@ -39,7 +38,7 @@
     "tui.tsx"
   ],
   "devDependencies": {
-    "@opencode-ai/plugin": "latest",
+    "@opencode/plugin": "latest",
     "@opentui/core": "latest",
     "@opentui/solid": "latest",
     "@types/node": "^26.1.2",

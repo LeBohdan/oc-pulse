@@ -6,6 +6,16 @@ Real-time LLM inference metrics visualization for OpenCode.
 
 Designed for AI researchers and developers using self-hosted inference servers. See generation speed and progress in real-time while waiting for LLM responses in OpenCode.
 
+## Demo
+
+**Prompt processing (prefill phase)** — progress and processing speed while the prompt is being processed:
+
+![Prompt processing demo](Prompt_processing.gif)
+
+**Generation and processing** — generation speed and token counts in real-time:
+
+![Generation and processing demo](Generation_and_processing.gif)
+
 ## Architecture
 
 This plugin works with **llama-swap-pulse**, a companion server that:
@@ -17,13 +27,13 @@ The plugin automatically connects to the pulse server based on your provider's `
 
 ## Install
 
-Add to your `~/.config/opencode/tui.json`:
+Add to your `~/.config/opencode/cli.json`:
 
 **From npm:**
 ```json
 {
-  "plugin": [
-    ["oc-pulse", { "port": 8090, "debug": true }]
+  "plugins": [
+    { "package": "oc-pulse", "options": { "port": 8090, "debug": true } }
   ]
 }
 ```
@@ -31,11 +41,13 @@ Add to your `~/.config/opencode/tui.json`:
 **From local file:**
 ```json
 {
-  "plugin": [
-    ["file:///path/to/oc-pulse", { "port": 8090, "debug": true }]
+  "plugins": [
+    { "package": "file:///path/to/oc-pulse", "options": { "port": 8090, "debug": true } }
   ]
 }
 ```
+
+> oc-pulse 2.x requires OpenCode 2.x. For OpenCode 1.x use oc-pulse 1.x registered in `tui.json`.
 
 ## Options
 
@@ -62,6 +74,9 @@ Live metrics are displayed in the right side of the session prompt:
 ### Generation Phase (response generation)
 - Generation speed (tokens/sec)
 - Number of tokens generated
+- Engine semantic status (Strata/Maya engines only): `Thinking` while the model
+  reasons, `Tool call` while it writes a tool call — shown instead of `Generation`
+  (e.g. `Thinking | 94.5 t/s | 132 tokens`)
 
 ### Completed Tasks
 - Total duration
